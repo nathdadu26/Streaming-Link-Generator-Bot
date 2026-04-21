@@ -1,23 +1,30 @@
+# ─────────────────────────────────────────────
+#  Dockerfile — Bunny Stream Telegram Bot
+#  Base: Python 3.11 slim
+# ─────────────────────────────────────────────
+
 FROM python:3.11-slim
 
-# Install system dependencies
-RUN apt-get update && apt-get install -y \
-    ffmpeg \
+# System deps (ffmpeg optional, sirf agar needed ho)
+RUN apt-get update && apt-get install -y --no-install-recommends \
     gcc \
-    curl \
     && rm -rf /var/lib/apt/lists/*
 
-# Set working directory
+# Working directory
 WORKDIR /app
 
-# Copy files
+# Requirements pehle copy karo (Docker cache optimize hoga)
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
+# Baaki files copy karo
 COPY . .
 
-# Create folders
-RUN mkdir -p downloads hls
+# Downloads folder banana (runtime mein bhi banega, yahan sirf safety ke liye)
+RUN mkdir -p downloads
 
-# Run bot
-CMD ["python", "main.py"]
+# Koyeb health check port
+EXPOSE 8000
+
+# Bot start karo
+CMD ["python", "bot.py"]
