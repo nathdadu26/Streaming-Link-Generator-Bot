@@ -1,4 +1,3 @@
 telethon
-FastTelethonhelper
 python-dotenv
 boto3
