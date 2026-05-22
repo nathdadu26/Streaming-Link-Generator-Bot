@@ -1,4 +1,4 @@
-telethon==1.36.0
-FastTelethon==1.0.8
-aiohttp==3.9.5
-python-dotenv==1.0.1
+telethon
+FastTelethon
+python-dotenv
+boto3
