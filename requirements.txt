@@ -1,4 +1,4 @@
 telethon
-git+https://github.com/Ggboom69/FastTelethon.git
+FastTelethonhelper
 python-dotenv
 boto3
