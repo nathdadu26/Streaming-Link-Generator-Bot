@@ -8,14 +8,15 @@ from botocore.config import Config
 from telethon import TelegramClient, events
 from telethon.tl.functions.upload import GetFileRequest
 from telethon.tl.types import InputDocumentFileLocation
+from telethon.crypto import AuthKey
 from dotenv import load_dotenv
 from health_check import start_health_server
 
 # ================== ENV ==================
 load_dotenv()
 
-API_ID   = int(os.getenv("API_ID"))
-API_HASH = os.getenv("API_HASH")
+API_ID    = int(os.getenv("API_ID"))
+API_HASH  = os.getenv("API_HASH")
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 R2_ACCOUNT_ID    = os.getenv("R2_ACCOUNT_ID")
 R2_ACCESS_KEY_ID = os.getenv("R2_ACCESS_KEY_ID")
@@ -25,8 +26,8 @@ R2_PUBLIC_DOMAIN = os.getenv("R2_PUBLIC_DOMAIN")
 R2_ENDPOINT = f"https://{R2_ACCOUNT_ID}.r2.cloudflarestorage.com"
 
 # ================== DOWNLOAD CONFIG ==================
-WORKERS        = 6           # parallel connections to Telegram
-PART_SIZE      = 512 * 1024  # 512 KB — must be multiple of 4096
+WORKERS        = 6           # parallel connections
+PART_SIZE      = 512 * 1024  # 512 KB — must stay as-is (Telegram requirement)
 PROGRESS_EVERY = 5           # seconds between progress edits
 
 # ================== LOG ==================
@@ -64,12 +65,12 @@ def human(size: float) -> str:
     return f"{size:.2f} PB"
 
 def progress_bar(current, total, start, label, filename):
-    pct     = current / total if total else 0
-    filled  = int(20 * pct)
-    bar     = "█" * filled + "░" * (20 - filled)
+    pct    = current / total if total else 0
+    filled = int(20 * pct)
+    bar    = "█" * filled + "░" * (20 - filled)
     elapsed = time.time() - start
-    speed   = current / elapsed if elapsed > 0 else 0
-    eta     = int((total - current) / speed) if speed > 0 else 0
+    speed  = current / elapsed if elapsed > 0 else 0
+    eta    = int((total - current) / speed) if speed > 0 else 0
     return (
         f"{label}\n\n"
         f"📄 File  : {filename}\n"
@@ -80,21 +81,17 @@ def progress_bar(current, total, start, label, filename):
     )
 
 # ─────────────────────────────────────────────
-# PARALLEL DOWNLOAD  (real multi-connection)
+# PARALLEL DOWNLOAD — uses bot's borrowed DC senders
 # ─────────────────────────────────────────────
 async def parallel_download(media, file_path: str, total_size: int, msg, filename: str):
     """
-    Opens WORKERS separate TelegramClient connections.
-    Each worker gets a queue of 512 KB part-numbers and writes
-    them directly to the correct offset in the pre-allocated file.
+    Uses bot._borrow_exported_sender(dc_id) to open multiple connections
+    to the correct DC where the file is stored, then fires GetFileRequest
+    with different offsets concurrently.
     """
-    # Pre-allocate file on disk
-    with open(file_path, "wb") as f:
-        f.seek(total_size - 1)
-        f.write(b"\0")
-
-    # Build the InputDocumentFileLocation from the media object
     doc = media.document
+    dc_id = doc.dc_id  # actual DC where file lives (was 4 in your logs)
+
     location = InputDocumentFileLocation(
         id=doc.id,
         access_hash=doc.access_hash,
@@ -107,15 +104,21 @@ async def parallel_download(media, file_path: str, total_size: int, msg, filenam
     for i in range(num_parts):
         await part_queue.put(i)
 
+    # Pre-allocate file
+    with open(file_path, "wb") as f:
+        f.seek(total_size - 1)
+        f.write(b"\0")
+
     downloaded_bytes = [0]
     dl_start  = time.time()
     last_edit = [0.0]
-    lock      = asyncio.Lock()
+    write_lock = asyncio.Lock()
+
+    log.info("Parallel download: %d parts, DC %d, %d workers", num_parts, dc_id, WORKERS)
 
     async def worker(worker_id: int):
-        # Each worker creates its own TelegramClient (user session reused)
-        client = TelegramClient(f"worker_{worker_id}", API_ID, API_HASH)
-        await client.start(bot_token=BOT_TOKEN)
+        # Borrow a sender for the correct DC — Telethon handles auth export internally
+        sender = await bot._borrow_exported_sender(dc_id)
         try:
             while True:
                 try:
@@ -123,13 +126,13 @@ async def parallel_download(media, file_path: str, total_size: int, msg, filenam
                 except asyncio.QueueEmpty:
                     break
 
-                offset     = part_no * PART_SIZE
-                limit      = min(PART_SIZE, total_size - offset)
-                retries    = 0
+                offset = part_no * PART_SIZE
+                limit  = min(PART_SIZE, total_size - offset)
+                retries = 0
 
-                while retries < 5:
+                while True:
                     try:
-                        result = await client(GetFileRequest(
+                        result = await sender.send(GetFileRequest(
                             location=location,
                             offset=offset,
                             limit=limit,
@@ -140,12 +143,12 @@ async def parallel_download(media, file_path: str, total_size: int, msg, filenam
                         break
                     except Exception as e:
                         retries += 1
+                        if retries >= 5:
+                            raise RuntimeError(f"Worker {worker_id} part {part_no} failed: {e}") from e
                         log.warning("Worker %d part %d retry %d: %s", worker_id, part_no, retries, e)
                         await asyncio.sleep(1)
-                else:
-                    raise RuntimeError(f"Worker {worker_id}: part {part_no} failed after 5 retries")
 
-                async with lock:
+                async with write_lock:
                     with open(file_path, "r+b") as f:
                         f.seek(offset)
                         f.write(data)
@@ -163,11 +166,12 @@ async def parallel_download(media, file_path: str, total_size: int, msg, filenam
 
                 part_queue.task_done()
         finally:
-            await client.disconnect()
+            await bot._return_exported_sender(sender)
 
     workers = [asyncio.create_task(worker(i)) for i in range(WORKERS)]
     await asyncio.gather(*workers)
-    log.info("Parallel download complete — %s", file_path)
+    log.info("Parallel download complete — %s (%.1f MB/s avg)",
+             file_path, total_size / (time.time() - dl_start) / 1_048_576)
 
 # ─────────────────────────────────────────────
 # HTML STREAMING PAGE
@@ -222,7 +226,8 @@ def r2_multipart_upload(s3, file_path, key, content_type="video/mp4", progress_c
                 chunk = f.read(CHUNK)
                 if not chunk:
                     break
-                r = s3.upload_part(Bucket=R2_BUCKET_NAME, Key=key, UploadId=uid, PartNumber=pn, Body=chunk)
+                r = s3.upload_part(Bucket=R2_BUCKET_NAME, Key=key,
+                                   UploadId=uid, PartNumber=pn, Body=chunk)
                 parts.append({"PartNumber": pn, "ETag": r["ETag"]})
                 sent += len(chunk)
                 if progress_cb:
@@ -235,7 +240,8 @@ def r2_multipart_upload(s3, file_path, key, content_type="video/mp4", progress_c
         raise R2Error(e) from e
 
 def r2_put(s3, content, key, content_type):
-    s3.put_object(Bucket=R2_BUCKET_NAME, Key=key, Body=content.encode(), ContentType=content_type)
+    s3.put_object(Bucket=R2_BUCKET_NAME, Key=key,
+                  Body=content.encode(), ContentType=content_type)
 
 # ─────────────────────────────────────────────
 # BOT HANDLER
@@ -245,16 +251,17 @@ async def handler(event):
     if not event.video:
         return await event.reply("❌ Pehle ek video bhejo.")
 
-    msg      = await event.reply("🚀 Starting...")
-    filename = event.file.name or f"video_{event.id}.mp4"
-    total_sz = event.file.size
+    msg       = await event.reply("🚀 Starting...")
+    filename  = event.file.name or f"video_{event.id}.mp4"
+    total_sz  = event.file.size
     file_path = os.path.join(DOWNLOAD_DIR, f"{event.id}_{filename}")
     folder_id = str(uuid.uuid4())[:8]
     video_key = f"{folder_id}/{filename}"
     page_key  = f"{folder_id}/index.html"
 
     # ── 1. PARALLEL DOWNLOAD ──
-    log.info("Downloading '%s' (%.1f MB) with %d workers", filename, total_sz/1_048_576, WORKERS)
+    log.info("Downloading '%s' (%.1f MB) DC=%d workers=%d",
+             filename, total_sz/1_048_576, event.message.media.document.dc_id, WORKERS)
     try:
         await parallel_download(event.message.media, file_path, total_sz, msg, filename)
     except Exception as e:
@@ -278,9 +285,9 @@ async def handler(event):
     await msg.edit(f"✅ Download done — {human(total_sz)}\n\n☁️ Uploading to Cloudflare R2...")
 
     # ── 2. UPLOAD TO R2 ──
-    s3       = get_r2()
-    up_last  = [0.0]
-    loop     = asyncio.get_event_loop()
+    s3      = get_r2()
+    up_last = [0.0]
+    loop    = asyncio.get_event_loop()
 
     def up_cb(sent, total, start):
         now = time.time()
@@ -327,5 +334,5 @@ async def handler(event):
 # ─────────────────────────────────────────────
 if __name__ == "__main__":
     start_health_server()
-    print("🤖 Bot Running — Parallel Download + R2 Upload")
+    print("🤖 Bot Running — Parallel DC-aware Download + R2 Upload")
     bot.run_until_disconnected()
