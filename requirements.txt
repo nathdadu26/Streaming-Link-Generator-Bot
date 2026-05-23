@@ -1,3 +1,4 @@
 telethon
-python-dotenv
+cryptg
 boto3
+python-dotenv
