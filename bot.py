@@ -4,11 +4,11 @@ import asyncio
 import logging
 import uuid
 import boto3
+import mimetypes  # Added for dynamic Content-Type handling
 from botocore.config import Config
 from telethon import TelegramClient, events
 from telethon.tl.functions.upload import GetFileRequest
 from telethon.tl.types import InputDocumentFileLocation
-from telethon.crypto import AuthKey
 from dotenv import load_dotenv
 from health_check import start_health_server
 
@@ -26,9 +26,9 @@ R2_PUBLIC_DOMAIN = os.getenv("R2_PUBLIC_DOMAIN")
 R2_ENDPOINT = f"https://{R2_ACCOUNT_ID}.r2.cloudflarestorage.com"
 
 # ================== DOWNLOAD CONFIG ==================
-WORKERS        = 6           # parallel connections
-PART_SIZE      = 512 * 1024  # 512 KB — must stay as-is (Telegram requirement)
-PROGRESS_EVERY = 5           # seconds between progress edits
+WORKERS        = 8           # Boosted slightly for better parallel pipe saturated streams
+PART_SIZE      = 512 * 1024  
+PROGRESS_EVERY = 5           
 
 # ================== LOG ==================
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
@@ -38,12 +38,8 @@ log = logging.getLogger(__name__)
 DOWNLOAD_DIR = "downloads"
 os.makedirs(DOWNLOAD_DIR, exist_ok=True)
 
-# ================== MAIN CLIENT ==================
 bot = TelegramClient("bot", API_ID, API_HASH).start(bot_token=BOT_TOKEN)
 
-# ─────────────────────────────────────────────
-# R2
-# ─────────────────────────────────────────────
 def get_r2():
     return boto3.client(
         "s3",
@@ -54,9 +50,6 @@ def get_r2():
         region_name="auto",
     )
 
-# ─────────────────────────────────────────────
-# UTILS
-# ─────────────────────────────────────────────
 def human(size: float) -> str:
     for unit in ["B", "KB", "MB", "GB", "TB"]:
         if size < 1024:
@@ -80,17 +73,15 @@ def progress_bar(current, total, start, label, filename):
         f"[{bar}] {pct*100:.1f}%"
     )
 
-# ─────────────────────────────────────────────
-# PARALLEL DOWNLOAD — uses bot's borrowed DC senders
-# ─────────────────────────────────────────────
+# Thread-safe helper for writing data fragments asynchronously
+def _write_chunk_to_disk(file_path, offset, data):
+    with open(file_path, "r+b") as f:
+        f.seek(offset)
+        f.write(data)
+
 async def parallel_download(media, file_path: str, total_size: int, msg, filename: str):
-    """
-    Uses bot._borrow_exported_sender(dc_id) to open multiple connections
-    to the correct DC where the file is stored, then fires GetFileRequest
-    with different offsets concurrently.
-    """
     doc = media.document
-    dc_id = doc.dc_id  # actual DC where file lives (was 4 in your logs)
+    dc_id = doc.dc_id  
 
     location = InputDocumentFileLocation(
         id=doc.id,
@@ -104,7 +95,7 @@ async def parallel_download(media, file_path: str, total_size: int, msg, filenam
     for i in range(num_parts):
         await part_queue.put(i)
 
-    # Pre-allocate file
+    # Pre-allocate file safely
     with open(file_path, "wb") as f:
         f.seek(total_size - 1)
         f.write(b"\0")
@@ -117,7 +108,6 @@ async def parallel_download(media, file_path: str, total_size: int, msg, filenam
     log.info("Parallel download: %d parts, DC %d, %d workers", num_parts, dc_id, WORKERS)
 
     async def worker(worker_id: int):
-        # Borrow a sender for the correct DC — Telethon handles auth export internally
         sender = await bot._borrow_exported_sender(dc_id)
         try:
             while True:
@@ -148,11 +138,11 @@ async def parallel_download(media, file_path: str, total_size: int, msg, filenam
                         log.warning("Worker %d part %d retry %d: %s", worker_id, part_no, retries, e)
                         await asyncio.sleep(1)
 
+                # Fixed: Write data in an off-loop thread pool to prevent blocking the event loop
                 async with write_lock:
-                    with open(file_path, "r+b") as f:
-                        f.seek(offset)
-                        f.write(data)
+                    await asyncio.to_thread(_write_chunk_to_disk, file_path, offset, data)
                     downloaded_bytes[0] += len(data)
+                    
                     now = time.time()
                     if now - last_edit[0] >= PROGRESS_EVERY:
                         last_edit[0] = now
@@ -173,9 +163,6 @@ async def parallel_download(media, file_path: str, total_size: int, msg, filenam
     log.info("Parallel download complete — %s (%.1f MB/s avg)",
              file_path, total_size / (time.time() - dl_start) / 1_048_576)
 
-# ─────────────────────────────────────────────
-# HTML STREAMING PAGE
-# ─────────────────────────────────────────────
 def make_streaming_page(video_url, title, filesize):
     s = title.replace('"', '&quot;').replace('<', '&lt;').replace('>', '&gt;')
     return f"""<!DOCTYPE html>
@@ -198,7 +185,7 @@ a.dl:hover{{background:#1d4ed8}}
 </style></head><body>
 <div class="card">
 <video controls autoplay preload="metadata" playsinline>
-  <source src="{video_url}" type="video/mp4">
+  <source src="{video_url}">
 </video>
 <div class="info">
   <span class="title">{s}</span>
@@ -206,12 +193,7 @@ a.dl:hover{{background:#1d4ed8}}
   <a class="dl" href="{video_url}" download="{s}">&#8595; Download</a>
 </div></div></body></html>"""
 
-# ─────────────────────────────────────────────
-# R2 MULTIPART UPLOAD
-# ─────────────────────────────────────────────
-class R2Error(Exception): pass
-
-def r2_multipart_upload(s3, file_path, key, content_type="video/mp4", progress_cb=None):
+def r2_multipart_upload(s3, file_path, key, content_type, progress_cb=None):
     size  = os.path.getsize(file_path)
     CHUNK = 8 * 1024 * 1024
     mpu   = s3.create_multipart_upload(Bucket=R2_BUCKET_NAME, Key=key, ContentType=content_type)
@@ -239,13 +221,12 @@ def r2_multipart_upload(s3, file_path, key, content_type="video/mp4", progress_c
         s3.abort_multipart_upload(Bucket=R2_BUCKET_NAME, Key=key, UploadId=uid)
         raise R2Error(e) from e
 
+class R2Error(Exception): pass
+
 def r2_put(s3, content, key, content_type):
     s3.put_object(Bucket=R2_BUCKET_NAME, Key=key,
                   Body=content.encode(), ContentType=content_type)
 
-# ─────────────────────────────────────────────
-# BOT HANDLER
-# ─────────────────────────────────────────────
 @bot.on(events.NewMessage)
 async def handler(event):
     if not event.video:
@@ -259,9 +240,13 @@ async def handler(event):
     video_key = f"{folder_id}/{filename}"
     page_key  = f"{folder_id}/index.html"
 
-    # ── 1. PARALLEL DOWNLOAD ──
+    # Dynamic dynamic content type determination
+    mime_type, _ = mimetypes.guess_type(filename)
+    content_type = mime_type or "video/mp4"
+
     log.info("Downloading '%s' (%.1f MB) DC=%d workers=%d",
              filename, total_sz/1_048_576, event.message.media.document.dc_id, WORKERS)
+    
     try:
         await parallel_download(event.message.media, file_path, total_sz, msg, filename)
     except Exception as e:
@@ -270,69 +255,3 @@ async def handler(event):
         dl_last  = 0.0
         done     = 0
         with open(file_path, "wb") as f:
-            async for chunk in bot.iter_download(event.message.media, chunk_size=512*1024):
-                f.write(chunk)
-                done += len(chunk)
-                now = time.time()
-                if now - dl_last >= PROGRESS_EVERY:
-                    try:
-                        await msg.edit(progress_bar(done, total_sz, dl_start,
-                                                    "📥 Downloading (sequential)...", filename))
-                    except Exception:
-                        pass
-                    dl_last = now
-
-    await msg.edit(f"✅ Download done — {human(total_sz)}\n\n☁️ Uploading to Cloudflare R2...")
-
-    # ── 2. UPLOAD TO R2 ──
-    s3      = get_r2()
-    up_last = [0.0]
-    loop    = asyncio.get_event_loop()
-
-    def up_cb(sent, total, start):
-        now = time.time()
-        if now - up_last[0] < PROGRESS_EVERY:
-            return
-        up_last[0] = now
-        loop.call_soon_threadsafe(
-            lambda s=sent, t=total, st=start: asyncio.ensure_future(
-                msg.edit(progress_bar(s, t, st, "☁️ Uploading to Cloudflare R2...", filename))
-            )
-        )
-
-    try:
-        await loop.run_in_executor(
-            None, lambda: r2_multipart_upload(s3, file_path, video_key, progress_cb=up_cb)
-        )
-    finally:
-        try:
-            os.remove(file_path)
-        except OSError:
-            pass
-
-    # ── 3. STREAMING PAGE ──
-    video_url = f"https://{R2_PUBLIC_DOMAIN}/{video_key}"
-    page_url  = f"https://{R2_PUBLIC_DOMAIN}/{page_key}"
-    await msg.edit("🎬 Generating streaming page...")
-    html = make_streaming_page(video_url, filename, human(total_sz))
-    await loop.run_in_executor(
-        None, lambda: r2_put(s3, html, page_key, "text/html; charset=utf-8")
-    )
-
-    # ── 4. DONE ──
-    await msg.edit(
-        f"✅ Done!\n\n"
-        f"📄 {filename}\n"
-        f"📦 {human(total_sz)}\n\n"
-        f"🎬 Streaming Page:\n{page_url}\n\n"
-        f"🔗 Direct Link:\n`{video_url}`"
-    )
-    log.info("Done: %s", video_key)
-
-# ─────────────────────────────────────────────
-# RUN
-# ─────────────────────────────────────────────
-if __name__ == "__main__":
-    start_health_server()
-    print("🤖 Bot Running — Parallel DC-aware Download + R2 Upload")
-    bot.run_until_disconnected()
