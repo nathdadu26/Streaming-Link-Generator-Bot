@@ -2,7 +2,6 @@ import os
 import time
 import logging
 import asyncio
-import httpx
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -20,11 +19,12 @@ API_HASH  = os.getenv("API_HASH", "")
 BOT_TOKEN = os.getenv("BOT_TOKEN", "")
 
 # Cloudflare R2 config
-R2_ACCOUNT_ID      = os.getenv("R2_ACCOUNT_ID", "")
-R2_ACCESS_KEY_ID   = os.getenv("R2_ACCESS_KEY_ID", "")
-R2_SECRET_KEY      = os.getenv("R2_SECRET_KEY", "")
-R2_BUCKET          = os.getenv("R2_BUCKET", "")
-R2_PUBLIC_URL      = os.getenv("R2_PUBLIC_URL", "")  # e.g. https://pub-xxx.r2.dev
+R2_ACCOUNT_ID    = os.getenv("R2_ACCOUNT_ID", "")
+R2_ACCESS_KEY_ID = os.getenv("R2_ACCESS_KEY_ID", "")
+R2_SECRET_KEY    = os.getenv("R2_SECRET_KEY", "")
+R2_BUCKET        = os.getenv("R2_BUCKET", "")
+R2_PUBLIC_URL    = os.getenv("R2_PUBLIC_URL", "")    # e.g. https://pub-xxx.r2.dev
+WORKER_BASE_URL  = os.getenv("WORKER_BASE_URL", "")  # e.g. https://your-worker.workers.dev
 
 DOWNLOAD_DIR      = "downloads"
 PROGRESS_INTERVAL = 5
@@ -102,10 +102,28 @@ def make_progress_callback(message: Message, action: str):
     return callback
 
 
-async def upload_to_r2(file_path: str, object_key: str) -> str:
-    """Upload file to R2 using S3-compatible API, return public URL."""
+def _guess_content_type(filename: str) -> str:
+    ext = Path(filename).suffix.lower()
+    return {
+        ".mp4":  "video/mp4",
+        ".mkv":  "video/x-matroska",
+        ".webm": "video/webm",
+        ".avi":  "video/x-msvideo",
+        ".mov":  "video/quicktime",
+        ".mp3":  "audio/mpeg",
+        ".m4a":  "audio/mp4",
+        ".ogg":  "audio/ogg",
+        ".pdf":  "application/pdf",
+        ".zip":  "application/zip",
+    }.get(ext, "application/octet-stream")
+
+
+async def upload_to_r2(file_path: str, original_name: str) -> tuple[str, str]:
+    """Upload to R2 with UUID key. Returns (watch_url, r2_public_url)."""
     import boto3
+    import uuid
     from botocore.config import Config
+    from urllib.parse import quote
 
     s3 = boto3.client(
         "s3",
@@ -116,10 +134,19 @@ async def upload_to_r2(file_path: str, object_key: str) -> str:
         region_name="auto",
     )
 
-    with open(file_path, "rb") as f:
-        s3.upload_fileobj(f, R2_BUCKET, object_key)
+    uid        = uuid.uuid4().hex
+    safe_name  = original_name.replace("/", "_").replace("\\", "_")
+    object_key = f"{uid}_{safe_name}"   # e.g. "a3f8c2d1_Movie.mkv"
 
-    return f"{R2_PUBLIC_URL.rstrip('/')}/{object_key}"
+    with open(file_path, "rb") as f:
+        s3.upload_fileobj(
+            f, R2_BUCKET, object_key,
+            ExtraArgs={"ContentType": _guess_content_type(original_name)}
+        )
+
+    r2_url    = f"{R2_PUBLIC_URL.rstrip('/')}/{quote(object_key)}"
+    watch_url = f"{WORKER_BASE_URL.rstrip('/')}/watch/{quote(object_key, safe='')}"
+    return watch_url, r2_url
 
 
 # =========================
@@ -192,8 +219,7 @@ async def media_handler(client: Client, message: Message):
 
     # ── Upload to R2 ─────────────────────────────────────────────────────────
     try:
-        object_key   = f"{message.from_user.id}/{message.id}/{original_name}"
-        download_url = await upload_to_r2(downloaded_path, object_key)
+        watch_url, r2_url = await upload_to_r2(downloaded_path, original_name)
     except Exception as e:
         logger.error(f"R2 upload failed: {e}")
         await safe_edit(progress_msg, f"❌ Upload to R2 failed:\n{e}")
@@ -204,13 +230,18 @@ async def media_handler(client: Client, message: Message):
         except Exception:
             pass
 
-    await safe_edit(
-        progress_msg,
+    try:
+        await progress_msg.delete()
+    except Exception:
+        pass
+
+    await message.reply_text(
         f"✅ Done!\n\n"
         f"📄 {original_name}\n"
         f"📦 {file_size}\n\n"
-        f"🔗 Download Link:\n{download_url}"
+        f"▶️ Watch / Stream:\n{watch_url}"
     )
+
 
 # =========================
 # /start
@@ -219,8 +250,9 @@ async def media_handler(client: Client, message: Message):
 @bot.on_message(filters.command("start"))
 async def start_handler(client: Client, message: Message):
     await message.reply_text(
-        "👋 Send me any file and I'll upload it to R2 and give you a download link!"
+        "👋 Send me any file and I'll upload it to R2 and give you a watch link!"
     )
+
 
 # =========================
 # RUN
