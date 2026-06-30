@@ -1,14 +1,14 @@
 FROM python:3.11-slim
 
+# Working directory
 WORKDIR /app
 
+# Dependencies pehle copy karo (caching ke liye)
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY . .
+# Sirf bot.py copy karo (renamer local pe chalega)
+COPY bot.py .
 
-RUN mkdir -p downloads
-
-EXPOSE 8000
-
-CMD ["sh", "-c", "python health_check.py & python bot.py"]
+# Koyeb env vars se config lega, .env ki zaroorat nahi
+CMD ["python", "bot.py"]
