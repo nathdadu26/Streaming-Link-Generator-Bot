@@ -1,0 +1,9 @@
+.env
+progress.json
+__pycache__/
+*.pyc
+*.pyo
+r2_rename_d1.py
+create_d1_table.py
+tg_bot.py
+.env.example
