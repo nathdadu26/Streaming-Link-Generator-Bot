@@ -1,14 +1,16 @@
 """
-R2 Renamer + Telegram Bot — Koyeb Deployment
-=============================================
+R2 Renamer + MEGA Downloader + Telegram Bot — Koyeb Deployment
+================================================================
 Bot commands:
-  /start          — Posting shuru karo (image pehle chahiye)
-  /stop           — Posting band karo
-  /status         — Stats dekho
-  /image          — Naya thumbnail image set karo
-  /rename <folder>— R2 folder ko rename karke D1 mein save karo
-  /cancelrename   — Chal rahi rename process rok do
-  /help           — Commands list
+  /start            — Posting shuru karo (image pehle chahiye)
+  /stop             — Posting band karo
+  /status           — Stats dekho
+  /image            — Naya thumbnail image set karo
+  /rename <folder>  — R2 folder ko rename karke D1 mein save karo
+  /cancelrename     — Chal rahi rename process rok do
+  /mega <link>      — MEGA link se download + R2 upload
+  /cancelmega       — Chal rahi MEGA download rok do
+  /help             — Commands list
 """
 
 import os
@@ -37,6 +39,7 @@ from telegram.ext import (
 )
 
 from health_check import run_health_server
+import mega_downloader
 
 # =====================================================
 # ENV
@@ -77,7 +80,7 @@ ADMIN_IDS      = {
 
 TARGET_FOLDER  = optional_env("TARGET_FOLDER", "new-videos/")
 PROGRESS_FILE  = optional_env("PROGRESS_FILE", "progress.json")
-POST_INTERVAL  = int(optional_env("POST_INTERVAL_SECONDS", "60"))
+POST_INTERVAL  = int(optional_env("POST_INTERVAL_SECONDS", "350"))  # 350s ≈ 247 posts/day
 
 if not TARGET_FOLDER.endswith("/"):
     TARGET_FOLDER += "/"
@@ -268,6 +271,11 @@ rename_state = {
     "thread"    : None,         # background thread
 }
 
+mega_state = {
+    "active"    : False,        # mega download chal rahi hai?
+    "thread"    : None,
+}
+
 # =====================================================
 # ADMIN CHECK
 # =====================================================
@@ -319,8 +327,9 @@ def rename_worker(folder: str, send_msg_sync):
         success = failed = duplicate = 0
         total_v = len(video_files)
 
-        # Progress update har 50 files pe
-        REPORT_EVERY = 50
+        # Progress update har 25% complete hone par
+        PROGRESS_MILESTONE_PCT = 25
+        last_milestone = -1
 
         for index, file_info in enumerate(video_files, start=1):
 
@@ -367,21 +376,25 @@ def rename_worker(folder: str, send_msg_sync):
                 progress["processed"] = list(processed)
                 success += 1
 
-                # Har 50 files pe progress save + Telegram update
-                if success % REPORT_EVERY == 0:
-                    save_progress(progress)
-                    send_msg_sync(
-                        f"⏳ *Progress* [{index}/{total_v}]\n\n"
-                        f"✅ Success : {success}\n"
-                        f"❌ Failed  : {failed}\n"
-                        f"⏭ Skip    : {duplicate}",
-                        parse_mode="Markdown"
-                    )
-
             except Exception as e:
                 failed += 1
                 logger.error(f"Rename error [{old_key}]: {e}")
                 time.sleep(1)
+
+            # 25% milestone pe progress save + Telegram update
+            pct = int((index / total_v) * 100)
+            milestone = (pct // PROGRESS_MILESTONE_PCT) * PROGRESS_MILESTONE_PCT
+            if milestone > last_milestone and milestone > 0:
+                last_milestone = milestone
+                save_progress(progress)
+                send_msg_sync(
+                    f"⏳ *Rename Progress* — {milestone}%\n\n"
+                    f"[{index}/{total_v}]\n"
+                    f"✅ Success : {success}\n"
+                    f"❌ Failed  : {failed}\n"
+                    f"⏭ Skip    : {duplicate}",
+                    parse_mode="Markdown"
+                )
 
         save_progress(progress)
 
@@ -558,6 +571,71 @@ async def cmd_cancelrename(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     rename_state["cancel"] = True
+    await update.message.reply_text("🛑 Cancel request bhej di... ruk rahi hai.")
+
+
+async def cmd_mega(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update):
+        return
+
+    if not context.args:
+        await update.message.reply_text(
+            "⚠️ MEGA link do.\n\n"
+            "Usage: `/mega https://mega.nz/folder/xxxx#yyyy`",
+            parse_mode="Markdown"
+        )
+        return
+
+    if mega_state["active"]:
+        await update.message.reply_text(
+            "⚠️ MEGA download pehle se chal rahi hai!\n"
+            "Rokne ke liye /cancelmega karo."
+        )
+        return
+
+    mega_link = context.args[0].strip()
+
+    mega_state["active"] = True
+    mega_downloader.control["cancel"] = False
+
+    loop = asyncio.get_event_loop()
+
+    def send_msg_sync(text, parse_mode=None):
+        """Thread-safe Telegram message sender — bot khud se message bhejta hai."""
+        coro = update.message.reply_text(text, parse_mode=parse_mode)
+        asyncio.run_coroutine_threadsafe(coro, loop)
+
+    def mega_worker():
+        try:
+            mega_downloader.run_mega_download(mega_link, send_msg_sync)
+        except Exception as e:
+            logger.error(f"MEGA worker fatal: {e}")
+            send_msg_sync(f"💥 Fatal Error: {e}")
+        finally:
+            mega_state["active"] = False
+
+    t = threading.Thread(target=mega_worker, daemon=True)
+    mega_state["thread"] = t
+    t.start()
+
+    await update.message.reply_text(
+        f"🚀 MEGA download shuru ho gayi!\n\n"
+        f"Har 25% progress pe update milega.\n"
+        f"Bandwidth limit lagne par 6 ghante baad auto-retry hoga.\n\n"
+        f"Rokne ke liye: /cancelmega",
+        parse_mode="Markdown"
+    )
+
+
+async def cmd_cancelmega(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update):
+        return
+
+    if not mega_state["active"]:
+        await update.message.reply_text("⚠️ Koi MEGA download chal nahi rahi.")
+        return
+
+    mega_downloader.control["cancel"] = True
     await update.message.reply_text("🛑 Cancel request bhej di... ruk rahi hai.")
 
 
