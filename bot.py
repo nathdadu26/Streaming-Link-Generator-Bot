@@ -36,6 +36,8 @@ from telegram.ext import (
     ContextTypes,
 )
 
+from health_check import run_health_server
+
 # =====================================================
 # ENV
 # =====================================================
@@ -68,9 +70,12 @@ CF_API_TOKEN   = require_env("CF_API_TOKEN")
 BOT_TOKEN      = require_env("TELEGRAM_BOT_TOKEN")
 CHANNEL_ID     = require_env("TELEGRAM_CHANNEL_ID")
 POST_URL       = require_env("POST_URL").rstrip("/")
-ADMIN_ID       = int(require_env("ADMIN_TELEGRAM_ID"))
+ADMIN_IDS_RAW  = require_env("ADMIN_TELEGRAM_ID")
+ADMIN_IDS      = {
+    int(x.strip()) for x in ADMIN_IDS_RAW.split(",") if x.strip()
+}
 
-TARGET_FOLDER  = optional_env("TARGET_FOLDER", "Renamed/")
+TARGET_FOLDER  = optional_env("TARGET_FOLDER", "new-videos/")
 PROGRESS_FILE  = optional_env("PROGRESS_FILE", "progress.json")
 POST_INTERVAL  = int(optional_env("POST_INTERVAL_SECONDS", "60"))
 
@@ -269,7 +274,7 @@ rename_state = {
 
 def is_admin(update: Update) -> bool:
     uid = update.effective_user.id
-    if uid != ADMIN_ID:
+    if uid not in ADMIN_IDS:
         logger.warning(f"Unauthorized: user_id={uid}")
         return False
     return True
@@ -602,10 +607,14 @@ async def posting_job(context: ContextTypes.DEFAULT_TYPE):
         bot_state["running"] = False
         for job in context.job_queue.get_jobs_by_name("poster"):
             job.schedule_removal()
-        await context.bot.send_message(
-            chat_id=ADMIN_ID,
-            text="✅ Saare videos post ho gaye! Posting band ho gayi.",
-        )
+        for admin_id in ADMIN_IDS:
+            try:
+                await context.bot.send_message(
+                    chat_id=admin_id,
+                    text="✅ Saare videos post ho gaye! Posting band ho gayi.",
+                )
+            except Exception as e:
+                logger.error(f"Notify admin {admin_id} failed: {e}")
         return
 
     url = f"{POST_URL}/{video['slug']}"
@@ -631,13 +640,16 @@ async def posting_job(context: ContextTypes.DEFAULT_TYPE):
 def main():
     d1_ensure_columns()
 
+    # Health check server start karo (Koyeb keep-alive ke liye)
+    run_health_server()
+
     logger.info("=" * 50)
     logger.info("  Bot + Renamer Starting")
     logger.info("=" * 50)
     logger.info(f"  Channel  : {CHANNEL_ID}")
     logger.info(f"  POST_URL : {POST_URL}")
     logger.info(f"  Interval : {POST_INTERVAL}s")
-    logger.info(f"  Admin ID : {ADMIN_ID}")
+    logger.info(f"  Admin IDs: {ADMIN_IDS}")
     logger.info("=" * 50)
 
     app = Application.builder().token(BOT_TOKEN).build()
