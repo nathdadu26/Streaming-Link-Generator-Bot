@@ -28,6 +28,12 @@ from threading import Lock
 import requests
 import boto3
 from boto3.s3.transfer import TransferConfig
+
+def progress_bar(pct: int, width: int = 10) -> str:
+    filled = int(width * pct / 100)
+    return "█" * filled + "░" * (width - filled)
+
+
 from Crypto.Cipher import AES
 from Crypto.Util import Counter
 
@@ -340,71 +346,68 @@ def _r2_object_exists(r2_key):
 # MAIN DOWNLOAD RUNNER
 # =====================================================
 
-def run_mega_download(mega_link: str, send_update):
+def run_mega_download(mega_link: str, live):
     """
-    mega_link  : MEGA folder/file link
-    send_update: callback(text: str) — bot.py se aayega, Telegram pe message bhejta hai
-
-    Return: dict with summary, ya None agar bandwidth limit ki wajah se beech mein ruka
-    Bandwidth limit hit hone par yeh function khud 6 ghante so kar retry karega,
-    isliye yeh function tab tak return nahi karega jab tak download fully complete
-    ya cancel na ho jaye.
+    mega_link : MEGA folder/file link
+    live      : LiveMessage object from bot.py (has update_sync + send_final_sync)
     """
     control["cancel"] = False
+
+    def _upd(text, **kw):
+        live.update_sync(text)
 
     try:
         link_type, link_id, link_key_str = _parse_link(mega_link)
     except ValueError as e:
-        send_update(f"❌ Invalid MEGA link: {e}")
+        live.send_final_sync(f"❌ Invalid MEGA link: {e}")
         return {"success": 0, "failed": 0, "error": str(e)}
 
     temp_dir = tempfile.mkdtemp()
 
     if link_type == "file":
-        return _run_single_file(link_id, link_key_str, temp_dir, send_update)
+        return _run_single_file(link_id, link_key_str, temp_dir, live)
 
-    return _run_folder(link_id, link_key_str, temp_dir, send_update)
+    return _run_folder(link_id, link_key_str, temp_dir, live)
 
 
-def _wait_for_bandwidth_reset(send_update):
+def _wait_for_bandwidth_reset(live):
     hours = BANDWIDTH_COOLDOWN_SECONDS // 3600
-    send_update(
+    live.update_sync(
         f"⛔ *MEGA Bandwidth Limit Hit*\n\n"
         f"Daily 3GB limit khatam ho gaya.\n"
         f"⏳ {hours} ghante baad automatically retry hoga.\n\n"
-        f"Cancel karne ke liye: /cancelmega",
-        parse_mode="Markdown",
+        f"Cancel: /cancel\\_mega"
     )
 
     waited = 0
     check_every = 30  # har 30s mein cancel check karo
     while waited < BANDWIDTH_COOLDOWN_SECONDS:
         if control["cancel"]:
-            send_update("🛑 Bandwidth wait cancel ho gaya.")
+            live.send_final_sync("🛑 Bandwidth wait cancel ho gaya.")
             return False
         time.sleep(check_every)
         waited += check_every
 
-    send_update("🔄 Cooldown khatam — download retry kar rahe hain...")
+    live.update_sync("🔄 Cooldown khatam — download retry kar rahe hain...")
     return True
 
 
-def _run_folder(folder_id, folder_key_str, temp_dir, send_update):
-    send_update(f"🔍 MEGA folder scan ho raha hai...")
+def _run_folder(folder_id, folder_key_str, temp_dir, live):
+    live.update_sync("⬇️ *MEGA Download*\n\nFolder scan ho raha hai...")
 
     while True:
         try:
             raw_nodes = _fetch_folder_nodes(folder_id)
             break
         except BandwidthLimitError:
-            if not _wait_for_bandwidth_reset(send_update):
+            if not _wait_for_bandwidth_reset(live):
                 return {"success": 0, "failed": 0, "cancelled": True}
         except Exception as e:
-            send_update(f"❌ Folder fetch error: {e}")
+            live.send_final_sync(f"❌ Folder fetch error: {e}")
             return {"success": 0, "failed": 1, "error": str(e)}
 
     if not raw_nodes:
-        send_update("❌ Koi files nahi mili — link invalid ya private hai.")
+        live.send_final_sync("❌ Koi files nahi mili — link invalid ya private hai.")
         return {"success": 0, "failed": 1}
 
     folder_key = _b64_to_a32(folder_key_str)
@@ -417,22 +420,21 @@ def _run_folder(folder_id, folder_key_str, temp_dir, send_update):
             break
 
     if not root_id:
-        send_update("❌ Root folder node nahi mila.")
+        live.send_final_sync("❌ Root folder node nahi mila.")
         return {"success": 0, "failed": 1}
 
     all_files = _collect_files(tree, root_id)
     total = len(all_files)
 
     if total == 0:
-        send_update("⚠️ Folder mein koi file nahi hai.")
+        live.send_final_sync("⚠️ Folder mein koi file nahi hai.")
         return {"success": 0, "failed": 0}
 
-    send_update(
-        f"📂 *Scan Complete*\n\n"
+    live.update_sync(
+        f"⬇️ *MEGA Download*\n\n"
         f"Folder : `{tree[root_id]['name']}`\n"
         f"Files  : {total}\n\n"
-        f"Download shuru ho raha hai...",
-        parse_mode="Markdown",
+        f"Shuru ho raha hai..."
     )
 
     success = failed = skipped = 0
@@ -441,12 +443,11 @@ def _run_folder(folder_id, folder_key_str, temp_dir, send_update):
     for idx, (node_handle, rel_path) in enumerate(all_files, 1):
 
         if control["cancel"]:
-            send_update(
-                f"🛑 *Download Cancelled*\n\n"
-                f"Done   : {success}\n"
-                f"Failed : {failed}\n"
-                f"Remaining: {total - idx + 1}",
-                parse_mode="Markdown",
+            live.send_final_sync(
+                f"🛑 *MEGA Download Cancelled*\n\n"
+                f"Done     : {success}\n"
+                f"Failed   : {failed}\n"
+                f"Remaining: {total - idx + 1}"
             )
             return {"success": success, "failed": failed, "cancelled": True}
 
@@ -479,7 +480,7 @@ def _run_folder(folder_id, folder_key_str, temp_dir, send_update):
                     # double safety — agar wait ke baad bhi turant fir 509 aaye
                     time.sleep(5)
                 retried_this_file = True
-                if not _wait_for_bandwidth_reset(send_update):
+                if not _wait_for_bandwidth_reset(live):
                     return {"success": success, "failed": failed, "cancelled": True}
                 # retry same file (loop continues)
 
@@ -493,28 +494,27 @@ def _run_folder(folder_id, folder_key_str, temp_dir, send_update):
         milestone = (pct // PROGRESS_MILESTONE_PCT) * PROGRESS_MILESTONE_PCT
         if milestone > last_milestone and milestone > 0:
             last_milestone = milestone
-            send_update(
-                f"⏳ *MEGA Download Progress* — {milestone}%\n\n"
-                f"[{idx}/{total}]\n"
-                f"✅ Success : {success}\n"
+            live.update_sync(
+                f"⬇️ *Downloading MEGA*\n\n"
+                f"`{progress_bar(milestone)}` {milestone}%\n"
+                f"[{idx}/{total}]\n\n"
+                f"✅ Done    : {success}\n"
                 f"❌ Failed  : {failed}\n"
-                f"⏭ Skipped : {skipped}",
-                parse_mode="Markdown",
+                f"⏭ Skipped : {skipped}"
             )
 
-    send_update(
+    live.send_final_sync(
         f"✅ *MEGA Download Complete!*\n\n"
         f"Success : {success}\n"
         f"Failed  : {failed}\n"
         f"Skipped : {skipped} (already in R2)\n\n"
-        f"R2 path: `{MEGA_TARGET_PREFIX}`",
-        parse_mode="Markdown",
+        f"R2 path: `{MEGA_TARGET_PREFIX}`"
     )
     return {"success": success, "failed": failed, "skipped": skipped}
 
 
-def _run_single_file(file_id, file_key_str, temp_dir, send_update):
-    send_update("🔍 MEGA file info fetch ho raha hai...")
+def _run_single_file(file_id, file_key_str, temp_dir, live):
+    live.update_sync("⬇️ *MEGA Download*\n\nFile info fetch ho raha hai...")
 
     while True:
         try:
@@ -523,10 +523,10 @@ def _run_single_file(file_id, file_key_str, temp_dir, send_update):
                 raise RuntimeError(f"MEGA API error: {result}")
             break
         except BandwidthLimitError:
-            if not _wait_for_bandwidth_reset(send_update):
+            if not _wait_for_bandwidth_reset(live):
                 return {"success": 0, "failed": 0, "cancelled": True}
         except Exception as e:
-            send_update(f"❌ File fetch error: {e}")
+            live.send_final_sync(f"❌ File fetch error: {e}")
             return {"success": 0, "failed": 1, "error": str(e)}
 
     dl_url = result["g"]
@@ -542,17 +542,17 @@ def _run_single_file(file_id, file_key_str, temp_dir, send_update):
     r2_key = MEGA_TARGET_PREFIX + filename
 
     if _r2_object_exists(r2_key):
-        send_update("⏭ File already R2 mein maujood hai. Skip.")
+        live.send_final_sync("⏭ File already R2 mein maujood hai. Skip.")
         return {"success": 0, "failed": 0, "skipped": 1}
 
-    send_update(f"⬇️ Downloading: `{filename}`", parse_mode="Markdown")
+    live.update_sync(f"⬇️ *MEGA Download*\n\n`{filename}`\n\nDownloading...")
 
     while True:
         try:
             _stream_download(dl_url, filepath, file_key, iv, filesize)
             break
         except BandwidthLimitError:
-            if not _wait_for_bandwidth_reset(send_update):
+            if not _wait_for_bandwidth_reset(live):
                 return {"success": 0, "failed": 0, "cancelled": True}
             # dl_url shayad expire ho gaya ho, dobara fetch karo
             try:
@@ -561,20 +561,19 @@ def _run_single_file(file_id, file_key_str, temp_dir, send_update):
             except BandwidthLimitError:
                 continue
         except Exception as e:
-            send_update(f"❌ Download failed: {e}")
+            live.send_final_sync(f"❌ Download failed: {e}")
             return {"success": 0, "failed": 1, "error": str(e)}
 
     try:
         _upload_to_r2(filepath, r2_key)
         os.remove(filepath)
     except Exception as e:
-        send_update(f"❌ Upload failed: {e}")
+        live.send_final_sync(f"❌ Upload failed: {e}")
         return {"success": 0, "failed": 1, "error": str(e)}
 
-    send_update(
+    live.send_final_sync(
         f"✅ *MEGA File Complete!*\n\n"
-        f"File: `{filename}`\n"
-        f"R2 key: `{r2_key}`",
-        parse_mode="Markdown",
+        f"File  : `{filename}`\n"
+        f"R2 key: `{r2_key}`"
     )
     return {"success": 1, "failed": 0}
