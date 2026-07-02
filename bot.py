@@ -92,6 +92,11 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+# Telegram internal polling logs suppress karo
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("telegram").setLevel(logging.WARNING)
+logging.getLogger("telegram.ext").setLevel(logging.WARNING)
+
 # ─────────────────────────────────────────────────────
 # MONGODB — rename progress
 # ─────────────────────────────────────────────────────
@@ -284,35 +289,23 @@ def is_admin(update: Update) -> bool:
 
 class LiveMessage:
     """
-    Sends one message, then edits it in-place.
-    Thread-safe: background threads call update_sync().
+    Background thread se Telegram message edit karta hai.
+    Initial message async command handler mein bheja jaata hai,
+    msg_id yahan inject hota hai — koi blocking call nahi.
     """
-    def __init__(self, loop, bot, chat_id, initial_text):
+    def __init__(self, loop, bot, chat_id, msg_id):
         self._loop    = loop
         self._bot     = bot
         self._chat_id = chat_id
-        self._msg_id  = None
+        self._msg_id  = msg_id
         self._last    = ""
         self._lock    = threading.Lock()
 
-        # Send initial message (from main async context)
-        fut = asyncio.run_coroutine_threadsafe(
-            self._send(initial_text), loop
-        )
-        fut.result(timeout=10)
-
-    async def _send(self, text):
-        msg = await self._bot.send_message(
-            chat_id=self._chat_id, text=text, parse_mode="Markdown"
-        )
-        self._msg_id = msg.message_id
-        self._last   = text
-
     def update_sync(self, text: str):
-        """Call from background thread — edits the live message."""
-        if text == self._last:
-            return
+        """Background thread se call karo — message in-place edit hoga."""
         with self._lock:
+            if text == self._last:
+                return
             self._last = text
         asyncio.run_coroutine_threadsafe(self._edit(text), self._loop)
 
@@ -328,10 +321,12 @@ class LiveMessage:
             logger.warning(f"LiveMessage edit failed: {e}")
 
     def send_final_sync(self, text: str):
-        """Send a NEW message for final result (so it doesn't disappear on scroll)."""
+        """Final result ke liye naya message bhejo."""
         asyncio.run_coroutine_threadsafe(
             self._bot.send_message(
-                chat_id=self._chat_id, text=text, parse_mode="Markdown"
+                chat_id    = self._chat_id,
+                text       = text,
+                parse_mode = "Markdown",
             ),
             self._loop,
         )
@@ -697,12 +692,18 @@ async def cmd_rename(update: Update, context: ContextTypes.DEFAULT_TYPE):
     rename_state["active"] = True
     rename_state["cancel"] = False
 
-    loop = asyncio.get_event_loop()
+    # Initial message async se bhejo, msg_id lo
+    sent = await update.message.reply_text(
+        f"🔄 *Renaming & Moving*\n`{folder}` → `{TARGET_FOLDER}`\n\nStarting...",
+        parse_mode="Markdown",
+    )
+
+    loop = asyncio.get_running_loop()
     live = LiveMessage(
-        loop=loop,
-        bot=context.bot,
-        chat_id=update.effective_chat.id,
-        initial_text=f"🔄 *Renaming & Moving*\n`{folder}` → `{TARGET_FOLDER}`\n\nStarting...",
+        loop    = loop,
+        bot     = context.bot,
+        chat_id = update.effective_chat.id,
+        msg_id  = sent.message_id,
     )
 
     t = threading.Thread(target=rename_worker, args=(folder, live), daemon=True)
@@ -739,19 +740,22 @@ async def cmd_mega(update: Update, context: ContextTypes.DEFAULT_TYPE):
     mega_state["active"] = True
     mega_downloader.control["cancel"] = False
 
-    loop = asyncio.get_event_loop()
-    live = LiveMessage(
-        loop=loop,
-        bot=context.bot,
-        chat_id=update.effective_chat.id,
-        initial_text=(
-            f"⬇️ *Downloading MEGA*\n"
-            f"`{mega_link[:60]}...`\n\n"
-            f"Starting..."
-        ),
+    # Initial message async se bhejo, msg_id lo
+    sent = await update.message.reply_text(
+        f"⬇️ *Downloading MEGA*\n"
+        f"`{mega_link[:60]}{'...' if len(mega_link) > 60 else ''}`\n\n"
+        f"Starting...",
+        parse_mode="Markdown",
     )
 
-    # mega_downloader expects update_sync + send_final_sync interface → pass live
+    loop = asyncio.get_running_loop()
+    live = LiveMessage(
+        loop    = loop,
+        bot     = context.bot,
+        chat_id = update.effective_chat.id,
+        msg_id  = sent.message_id,
+    )
+
     t = threading.Thread(target=mega_worker_fn, args=(mega_link, live), daemon=True)
     mega_state["thread"] = t
     t.start()
