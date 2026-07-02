@@ -38,18 +38,21 @@ def self_ping_loop():
     """Background thread — khud ko ping karte rehna taaki Koyeb sleep na kare."""
     if not SELF_URL:
         logger.warning(
-            "KOYEB_PUBLIC_URL set nahi hai — self-ping skip ho raha hai. "
-            "Koyeb dashboard se apna public URL env var mein daalo."
+            "KOYEB_PUBLIC_URL set nahi hai — self-ping disabled. "
+            "Koyeb dashboard → Environment Variables mein apna public URL daalo."
         )
         return
 
-    # Pehli ping se thoda pehle ruko taaki server ready ho jaye
-    time.sleep(30)
+    logger.info(f"Self-ping shuru: {SELF_URL}/health (har {PING_INTERVAL}s)")
+    time.sleep(30)  # server ready hone do
 
     while True:
         try:
             resp = requests.get(f"{SELF_URL}/health", timeout=10)
-            logger.info(f"Self-ping: {resp.status_code}")
+            if resp.status_code == 200:
+                logger.info(f"Self-ping OK (200)")
+            else:
+                logger.warning(f"Self-ping unexpected status: {resp.status_code} — check KOYEB_PUBLIC_URL")
         except Exception as e:
             logger.warning(f"Self-ping failed: {e}")
 
